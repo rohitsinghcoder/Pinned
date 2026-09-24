@@ -10,6 +10,7 @@ import android.provider.Settings
 import android.text.format.DateFormat
 import android.text.format.DateUtils
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -71,8 +72,11 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -94,6 +98,7 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -109,6 +114,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
@@ -140,11 +146,23 @@ class MainActivity : ComponentActivity() {
     // Bumped on every resume so permission / battery state is re-checked
     // after the user comes back from system settings.
     private val resumeTick = mutableIntStateOf(0)
+    private val themeMode = mutableStateOf(ThemeMode.System)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        setContent { PinnedTheme { PinnedApp(resumeTick.intValue) } }
+        themeMode.value = Store.theme(this)
+        setContent {
+            PinnedTheme(themeMode.value) {
+                PinnedApp(
+                    resumeTick = resumeTick.intValue,
+                    theme = themeMode.value,
+                    onTheme = {
+                        themeMode.value = it
+                        Store.setTheme(this, it)
+                    },
+                )
+            }
+        }
     }
 
     override fun onResume() {
@@ -154,25 +172,59 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun PinnedTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
+private fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        ThemeMode.System -> isSystemInDarkTheme()
+        ThemeMode.Light -> false
+        ThemeMode.Dark, ThemeMode.Amoled -> true
+    }
     val ctx = LocalContext.current
-    val scheme = when {
+    val base = when {
         Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
         dark -> darkColorScheme()
         else -> lightColorScheme()
     }
-    MaterialTheme(colorScheme = scheme, content = content)
+    // AMOLED: true black behind everything, with near-black steps so cards stay visible.
+    val scheme = if (mode == ThemeMode.Amoled) base.copy(
+        background = Color.Black,
+        surface = Color.Black,
+        surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF0B0B0B),
+        surfaceContainer = Color(0xFF111111),
+        surfaceContainerHigh = Color(0xFF181818),
+        surfaceContainerHighest = Color(0xFF202020),
+    ) else base
+
+    // Keep status/navigation bar icons readable when the app theme differs from the system's.
+    val activity = LocalContext.current as ComponentActivity
+    DisposableEffect(dark) {
+        val transparent = android.graphics.Color.TRANSPARENT
+        val style = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
+        activity.enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+        onDispose {}
+    }
+
+    val animated = scheme.copy(
+        primary = animateColorAsState(scheme.primary, label = "primary").value,
+        surface = animateColorAsState(scheme.surface, label = "surface").value,
+        surfaceContainer = animateColorAsState(scheme.surfaceContainer, label = "container").value,
+        surfaceContainerLow = animateColorAsState(scheme.surfaceContainerLow, label = "low").value,
+        surfaceContainerHigh = animateColorAsState(scheme.surfaceContainerHigh, label = "high").value,
+        onSurface = animateColorAsState(scheme.onSurface, label = "onSurface").value,
+        onSurfaceVariant = animateColorAsState(scheme.onSurfaceVariant, label = "onSurfaceVariant").value,
+    )
+    MaterialTheme(colorScheme = animated, content = content)
 }
 
 @Composable
-private fun PinnedApp(resumeTick: Int) {
+private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val pins = remember { mutableStateListOf<Pin>().apply { addAll(Store.load(ctx)) } }
     val history = remember { mutableStateListOf<Done>().apply { addAll(Store.loadDone(ctx)) } }
     var historyOpen by remember { mutableStateOf(false) }
+    var appearanceOpen by remember { mutableStateOf(false) }
     var composerOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Pin?>(null) }
     // Pin waiting for the "Mark as done?" confirmation.
@@ -312,7 +364,13 @@ private fun PinnedApp(resumeTick: Int) {
             ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            item(key = "header") { Header(pins.size, onMenu = { historyOpen = true }) }
+            item(key = "header") {
+                Header(
+                    pins.size,
+                    onDoneHistory = { historyOpen = true },
+                    onAppearance = { appearanceOpen = true },
+                )
+            }
 
             if (!notificationsOn) {
                 item(key = "hint-notif") {
@@ -395,6 +453,10 @@ private fun PinnedApp(resumeTick: Int) {
         )
     }
 
+    if (appearanceOpen) {
+        AppearanceDialog(theme, onPick = onTheme, onDismiss = { appearanceOpen = false })
+    }
+
     AnimatedVisibility(
         historyOpen,
         enter = slideInHorizontally { it } + fadeIn(),
@@ -406,7 +468,7 @@ private fun PinnedApp(resumeTick: Int) {
 }
 
 @Composable
-private fun Header(count: Int, onMenu: () -> Unit) {
+private fun Header(count: Int, onDoneHistory: () -> Unit, onAppearance: () -> Unit) {
     Row(Modifier.padding(start = 4.dp, top = 24.dp, bottom = 14.dp)) {
         Column(Modifier.weight(1f)) {
             Text(
@@ -427,10 +489,98 @@ private fun Header(count: Int, onMenu: () -> Unit) {
                 )
             }
         }
-        IconButton(onClick = onMenu, modifier = Modifier.offset(x = 8.dp, y = (-4).dp)) {
-            Icon(Icons.Rounded.Menu, contentDescription = "Done history")
+        Box(Modifier.offset(x = 8.dp, y = (-4).dp)) {
+            var menuOpen by remember { mutableStateOf(false) }
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Rounded.Menu, contentDescription = "Menu")
+            }
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+                shape = RoundedCornerShape(20.dp),
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            ) {
+                DropdownMenuItem(
+                    text = { Text("Done") },
+                    leadingIcon = { Icon(Icons.Rounded.Check, contentDescription = null) },
+                    onClick = { menuOpen = false; onDoneHistory() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Appearance") },
+                    leadingIcon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
+                    onClick = { menuOpen = false; onAppearance() },
+                )
+            }
         }
     }
+}
+
+@Composable
+private fun AppearanceDialog(current: ThemeMode, onPick: (ThemeMode) -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Appearance") },
+        text = {
+            Column {
+                ThemeMode.entries.forEach { mode ->
+                    val selected = mode == current
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(
+                                if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent
+                            )
+                            .clickable { onPick(mode) }
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ThemeSwatch(mode)
+                        Spacer(Modifier.size(14.dp))
+                        Text(
+                            mode.label,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (selected) {
+                            Icon(
+                                Icons.Rounded.Check,
+                                contentDescription = "Selected",
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        shape = RoundedCornerShape(28.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+    )
+}
+
+/** Small circle previewing a theme; System is drawn half light, half dark. */
+@Composable
+private fun ThemeSwatch(mode: ThemeMode) {
+    val light = Color(0xFFF4F4F6)
+    val dark = Color(0xFF26272B)
+    Box(
+        Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+            .background(
+                when (mode) {
+                    ThemeMode.Light -> SolidColor(light)
+                    ThemeMode.Dark -> SolidColor(dark)
+                    ThemeMode.Amoled -> SolidColor(Color.Black)
+                    ThemeMode.System -> Brush.horizontalGradient(
+                        0f to light, 0.5f to light, 0.5f to dark, 1f to dark
+                    )
+                }
+            )
+    )
 }
 
 @Composable

@@ -9,6 +9,13 @@ data class Pin(val id: Int, val title: String, val note: String, val created: Lo
 
 data class Done(val pin: Pin, val doneAt: Long)
 
+enum class ThemeMode(val label: String) {
+    System("System"),
+    Light("Light"),
+    Dark("Dark"),
+    Amoled("AMOLED black"),
+}
+
 /** Midnight at the start of today, shifted by [daysAgo] days. */
 fun startOfDay(daysAgo: Int = 0): Long = Calendar.getInstance().apply {
     set(Calendar.HOUR_OF_DAY, 0)
@@ -73,6 +80,14 @@ object Store {
         }
         prefs(ctx).edit().putString("done", arr.toString()).apply()
     }
+
+    fun theme(ctx: Context): ThemeMode =
+        prefs(ctx).getString("theme", null)
+            ?.let { name -> ThemeMode.entries.firstOrNull { it.name == name } }
+            ?: ThemeMode.System
+
+    fun setTheme(ctx: Context, mode: ThemeMode) =
+        prefs(ctx).edit().putString("theme", mode.name).apply()
 
     fun nextId(ctx: Context): Int {
         val p = prefs(ctx)
