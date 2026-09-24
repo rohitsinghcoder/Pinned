@@ -95,9 +95,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -503,8 +505,9 @@ private fun Composer(
         ) {
             BackHandler { close(onDismiss) }
 
-            var title by remember { mutableStateOf(initial?.title ?: "") }
-            var note by remember { mutableStateOf(initial?.note ?: "") }
+            // Start with the cursor after the existing text when editing.
+            var title by remember { mutableStateOf(endOf(initial?.title ?: "")) }
+            var note by remember { mutableStateOf(endOf(initial?.note ?: "")) }
             val focus = remember { FocusRequester() }
             // Focus on the very first frame so the keyboard opens together with the panel.
             LaunchedEffect(Unit) { focus.requestFocus() }
@@ -546,8 +549,8 @@ private fun Composer(
                         }
                         Spacer(Modifier.weight(1f))
                         Button(
-                            onClick = { close { onSave(title.trim(), note.trim()) } },
-                            enabled = title.isNotBlank(),
+                            onClick = { close { onSave(title.text.trim(), note.text.trim()) } },
+                            enabled = title.text.isNotBlank(),
                             shape = RoundedCornerShape(16.dp),
                             contentPadding = PaddingValues(horizontal = 28.dp, vertical = 14.dp),
                         ) {
@@ -584,10 +587,12 @@ private fun ConfirmDone(pin: Pin, onConfirm: () -> Unit, onDismiss: () -> Unit) 
     )
 }
 
+private fun endOf(text: String) = TextFieldValue(text, TextRange(text.length))
+
 @Composable
 private fun Field(
-    value: String,
-    onChange: (String) -> Unit,
+    value: TextFieldValue,
+    onChange: (TextFieldValue) -> Unit,
     placeholder: String,
     style: TextStyle,
     modifier: Modifier = Modifier,
@@ -601,7 +606,7 @@ private fun Field(
         keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
         decorationBox = { inner ->
             Box {
-                if (value.isEmpty()) {
+                if (value.text.isEmpty()) {
                     Text(
                         placeholder,
                         style = style,
