@@ -9,6 +9,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.format.DateUtils
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -19,9 +20,13 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,12 +34,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -44,13 +53,13 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -65,7 +74,6 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -85,6 +93,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -132,8 +141,12 @@ private fun PinnedApp(resumeTick: Int) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val pins = remember { mutableStateListOf<Pin>().apply { addAll(Store.load(ctx)) } }
-    var sheetOpen by remember { mutableStateOf(false) }
+    var composerOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Pin?>(null) }
+    // Pin waiting for the "Mark as done?" confirmation.
+    var confirming by remember { mutableStateOf<Pin?>(null) }
+    // Pins confirmed as done, briefly showing their check before they leave the list.
+    val completing = remember { mutableStateListOf<Int>() }
 
     val notificationsOn = remember(resumeTick) {
         NotificationManagerCompat.from(ctx).areNotificationsEnabled()
@@ -176,6 +189,16 @@ private fun PinnedApp(resumeTick: Int) {
         }
     }
 
+    // Called once the user confirms: show the check for a beat, then remove.
+    fun complete(pin: Pin) {
+        completing.add(pin.id)
+        scope.launch {
+            delay(320)
+            completing.remove(pin.id)
+            done(pin)
+        }
+    }
+
     fun save(title: String, note: String) {
         val current = editing
         val pin = if (current == null) {
@@ -195,7 +218,7 @@ private fun PinnedApp(resumeTick: Int) {
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { editing = null; sheetOpen = true },
+                onClick = { editing = null; composerOpen = true },
                 shape = RoundedCornerShape(20.dp),
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
             ) {
@@ -245,19 +268,27 @@ private fun PinnedApp(resumeTick: Int) {
                 PinRow(
                     pin = pin,
                     modifier = Modifier.animateItem(),
-                    onDone = { done(pin) },
-                    onClick = { editing = pin; sheetOpen = true },
+                    checked = pin.id in completing,
+                    onRequestDone = { confirming = pin },
+                    onClick = { editing = pin; composerOpen = true },
                 )
             }
         }
     }
 
-    if (sheetOpen) {
-        PinSheet(
-            initial = editing,
-            onDismiss = { sheetOpen = false },
-            onSave = { title, note -> save(title, note); sheetOpen = false },
-            onDone = { editing?.let { done(it) }; sheetOpen = false },
+    Composer(
+        visible = composerOpen,
+        initial = editing,
+        onDismiss = { composerOpen = false },
+        onSave = { title, note -> save(title, note); composerOpen = false },
+        onRequestDone = { confirming = editing; composerOpen = false },
+    )
+
+    confirming?.let { pin ->
+        ConfirmDone(
+            pin = pin,
+            onConfirm = { confirming = null; complete(pin) },
+            onDismiss = { confirming = null },
         )
     }
 }
@@ -335,16 +366,20 @@ private fun EmptyState() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PinRow(pin: Pin, modifier: Modifier, onDone: () -> Unit, onClick: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var checked by remember { mutableStateOf(false) }
+private fun PinRow(
+    pin: Pin,
+    modifier: Modifier,
+    checked: Boolean,
+    onRequestDone: () -> Unit,
+    onClick: () -> Unit,
+) {
+    // A full swipe only asks for confirmation; the card always springs back.
     val swipe = rememberSwipeToDismissBoxState(
         confirmValueChange = {
-            if (it != SwipeToDismissBoxValue.Settled) {
-                onDone()
-                true
-            } else false
-        }
+            if (it != SwipeToDismissBoxValue.Settled) onRequestDone()
+            false
+        },
+        positionalThreshold = { width -> width * 0.55f },
     )
     val shape = RoundedCornerShape(24.dp)
 
@@ -400,15 +435,7 @@ private fun PinRow(pin: Pin, modifier: Modifier, onDone: () -> Unit, onClick: ()
                         color = MaterialTheme.colorScheme.outline,
                     )
                 }
-                CheckCircle(checked) {
-                    if (!checked) {
-                        checked = true
-                        scope.launch {
-                            delay(280)
-                            onDone()
-                        }
-                    }
-                }
+                CheckCircle(checked) { if (!checked) onRequestDone() }
             }
         }
     }
@@ -439,66 +466,122 @@ private fun CheckCircle(checked: Boolean, onClick: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Bottom panel that rides on top of the keyboard. It lives in the activity window (not a
+ * separate sheet window), so the panel and keyboard slide up together in one motion.
+ */
 @Composable
-private fun PinSheet(
+private fun Composer(
+    visible: Boolean,
     initial: Pin?,
     onDismiss: () -> Unit,
     onSave: (String, String) -> Unit,
-    onDone: () -> Unit,
+    onRequestDone: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val scope = rememberCoroutineScope()
-    var title by remember { mutableStateOf(initial?.title ?: "") }
-    var note by remember { mutableStateOf(initial?.note ?: "") }
-    val focus = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) {
-        delay(150)
-        runCatching { focus.requestFocus() }
-    }
-
-    // Animate the sheet away before acting, so closing always feels smooth.
+    val focusManager = LocalFocusManager.current
     fun close(action: () -> Unit) {
-        scope.launch { sheetState.hide() }.invokeOnCompletion { action() }
+        focusManager.clearFocus()
+        action()
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-    ) {
-        Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 24.dp).imePadding()) {
-            Text(
-                if (initial == null) "New pin" else "Edit pin",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+    Box(Modifier.fillMaxSize()) {
+        AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut()) {
+            Box(
+                Modifier.fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { close(onDismiss) }
             )
-            Spacer(Modifier.height(10.dp))
-            Field(
-                title, { title = it }, "What should you remember?",
-                MaterialTheme.typography.headlineSmall,
-                Modifier.focusRequester(focus),
-            )
-            Spacer(Modifier.height(10.dp))
-            Field(note, { note = it }, "Add a note", MaterialTheme.typography.bodyLarge)
-            Spacer(Modifier.height(28.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (initial != null) {
-                    TextButton(onClick = { close(onDone) }) { Text("Mark done") }
-                }
-                Spacer(Modifier.weight(1f))
-                Button(
-                    onClick = { close { onSave(title.trim(), note.trim()) } },
-                    enabled = title.isNotBlank(),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 28.dp, vertical = 14.dp),
+        }
+        AnimatedVisibility(
+            visible,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = slideInVertically { it / 4 } + fadeIn(),
+            exit = slideOutVertically { it / 4 } + fadeOut(),
+        ) {
+            BackHandler { close(onDismiss) }
+
+            var title by remember { mutableStateOf(initial?.title ?: "") }
+            var note by remember { mutableStateOf(initial?.note ?: "") }
+            val focus = remember { FocusRequester() }
+            // Focus on the very first frame so the keyboard opens together with the panel.
+            LaunchedEffect(Unit) { focus.requestFocus() }
+
+            Surface(
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    Modifier
+                        .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
+                        .padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 16.dp)
                 ) {
-                    Text(if (initial == null) "Pin it" else "Save")
+                    Box(
+                        Modifier.align(Alignment.CenterHorizontally)
+                            .size(width = 36.dp, height = 4.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.outlineVariant)
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Text(
+                        if (initial == null) "New pin" else "Edit pin",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Field(
+                        title, { title = it }, "What should you remember?",
+                        MaterialTheme.typography.headlineSmall,
+                        Modifier.focusRequester(focus),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Field(note, { note = it }, "Add a note", MaterialTheme.typography.bodyLarge)
+                    Spacer(Modifier.height(24.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (initial != null) {
+                            TextButton(onClick = { close(onRequestDone) }) { Text("Mark done") }
+                        }
+                        Spacer(Modifier.weight(1f))
+                        Button(
+                            onClick = { close { onSave(title.trim(), note.trim()) } },
+                            enabled = title.isNotBlank(),
+                            shape = RoundedCornerShape(16.dp),
+                            contentPadding = PaddingValues(horizontal = 28.dp, vertical = 14.dp),
+                        ) {
+                            Text(if (initial == null) "Pin it" else "Save")
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun ConfirmDone(pin: Pin, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Rounded.Check, contentDescription = null) },
+        title = { Text("Mark as done?") },
+        text = {
+            Text(
+                "“${pin.title}” will be unpinned from your notifications.",
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            Button(onClick = onConfirm, shape = RoundedCornerShape(14.dp)) { Text("Done") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+        shape = RoundedCornerShape(28.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+    )
 }
 
 @Composable
