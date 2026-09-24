@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.format.DateFormat
 import android.text.format.DateUtils
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -24,7 +25,9 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
@@ -43,6 +46,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -51,6 +55,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -61,8 +66,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -123,6 +131,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.core.app.NotificationManagerCompat
+import java.util.Date
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -162,6 +171,8 @@ private fun PinnedApp(resumeTick: Int) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
     val pins = remember { mutableStateListOf<Pin>().apply { addAll(Store.load(ctx)) } }
+    val history = remember { mutableStateListOf<Done>().apply { addAll(Store.loadDone(ctx)) } }
+    var historyOpen by remember { mutableStateOf(false) }
     var composerOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Pin?>(null) }
     // Pin waiting for the "Mark as done?" confirmation.
@@ -225,6 +236,8 @@ private fun PinnedApp(resumeTick: Int) {
         pins.removeAt(index)
         persist()
         Notifier.cancel(ctx, pin.id)
+        history.add(0, Done(pin, System.currentTimeMillis()))
+        Store.saveDone(ctx, history.toList())
         scope.launch {
             snackbar.currentSnackbarData?.dismiss()
             val result = snackbar.showSnackbar(
@@ -236,8 +249,19 @@ private fun PinnedApp(resumeTick: Int) {
                 pins.add(index.coerceAtMost(pins.size), pin)
                 persist()
                 Notifier.show(ctx, pin)
+                history.removeAll { it.pin.id == pin.id }
+                Store.saveDone(ctx, history.toList())
             }
         }
+    }
+
+    // Brings a completed pin back to the top of the list and the notification shade.
+    fun restore(item: Done) {
+        history.remove(item)
+        Store.saveDone(ctx, history.toList())
+        pins.add(0, item.pin)
+        persist()
+        Notifier.show(ctx, item.pin, silent = false)
     }
 
     // Called once the user confirms: show the check for a beat, then remove.
@@ -288,7 +312,7 @@ private fun PinnedApp(resumeTick: Int) {
             ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            item(key = "header") { Header(pins.size) }
+            item(key = "header") { Header(pins.size, onMenu = { historyOpen = true }) }
 
             if (!notificationsOn) {
                 item(key = "hint-notif") {
@@ -370,27 +394,192 @@ private fun PinnedApp(resumeTick: Int) {
             onDismiss = { confirming = null },
         )
     }
+
+    AnimatedVisibility(
+        historyOpen,
+        enter = slideInHorizontally { it } + fadeIn(),
+        exit = slideOutHorizontally { it } + fadeOut(),
+    ) {
+        BackHandler { historyOpen = false }
+        HistoryScreen(history, onBack = { historyOpen = false }, onRestore = { restore(it) })
+    }
 }
 
 @Composable
-private fun Header(count: Int) {
-    Column(Modifier.padding(start = 4.dp, top = 24.dp, bottom = 14.dp)) {
-        Text(
-            "Pinned",
-            style = MaterialTheme.typography.displaySmall,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Spacer(Modifier.height(4.dp))
-        AnimatedContent(count, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "count") { n ->
+private fun Header(count: Int, onMenu: () -> Unit) {
+    Row(Modifier.padding(start = 4.dp, top = 24.dp, bottom = 14.dp)) {
+        Column(Modifier.weight(1f)) {
             Text(
-                when (n) {
-                    0 -> "Nothing on your mind"
-                    1 -> "1 thing to remember"
-                    else -> "$n things to remember"
-                },
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                "Pinned",
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.SemiBold,
             )
+            Spacer(Modifier.height(4.dp))
+            AnimatedContent(count, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "count") { n ->
+                Text(
+                    when (n) {
+                        0 -> "Nothing on your mind"
+                        1 -> "1 thing to remember"
+                        else -> "$n things to remember"
+                    },
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        IconButton(onClick = onMenu, modifier = Modifier.offset(x = 8.dp, y = (-4).dp)) {
+            Icon(Icons.Rounded.Menu, contentDescription = "Done history")
+        }
+    }
+}
+
+@Composable
+private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (Done) -> Unit) {
+    val today = startOfDay(0)
+    val todayItems = history.filter { it.doneAt >= today }
+    val yesterdayItems = history.filter { it.doneAt < today }
+
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+        LazyColumn(
+            contentPadding = PaddingValues(
+                start = 20.dp,
+                end = 20.dp,
+                top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
+                bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 24.dp,
+            ),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            item(key = "top") {
+                Column {
+                    IconButton(onClick = onBack, modifier = Modifier.offset(x = (-8).dp)) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
+                    }
+                    Column(Modifier.padding(start = 4.dp, top = 12.dp, bottom = 14.dp)) {
+                        Text(
+                            "Done",
+                            style = MaterialTheme.typography.displaySmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            when (todayItems.size) {
+                                0 -> "Nothing finished today yet"
+                                1 -> "1 thing finished today"
+                                else -> "${todayItems.size} things finished today"
+                            },
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            if (history.isEmpty()) {
+                item(key = "empty") {
+                    Column(
+                        Modifier.fillMaxWidth().padding(top = 80.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Box(
+                            Modifier.size(88.dp).clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.secondaryContainer),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Rounded.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(36.dp),
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            )
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        Text("Nothing done yet", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Things you finish today and\nyesterday will show up here.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            }
+
+            listOf("Today" to todayItems, "Yesterday" to yesterdayItems).forEach { (label, items) ->
+                if (items.isNotEmpty()) {
+                    item(key = "label-$label") {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 2.dp).animateItem(),
+                        )
+                    }
+                    items(items, key = { "done-${it.pin.id}-${it.doneAt}" }) { item ->
+                        DoneRow(item, Modifier.animateItem()) { onRestore(item) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DoneRow(item: Done, modifier: Modifier, onRestore: () -> Unit) {
+    val ctx = LocalContext.current
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(start = 16.dp, end = 6.dp, top = 16.dp, bottom = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.size(24.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Rounded.Check,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimary,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            Spacer(Modifier.size(14.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    item.pin.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textDecoration = TextDecoration.LineThrough,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (item.pin.note.isNotBlank()) {
+                    Text(
+                        item.pin.note,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.outline,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Done at " + DateFormat.getTimeFormat(ctx).format(Date(item.doneAt)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            IconButton(onClick = onRestore) {
+                Icon(
+                    Icons.Rounded.Refresh,
+                    contentDescription = "Pin again",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
