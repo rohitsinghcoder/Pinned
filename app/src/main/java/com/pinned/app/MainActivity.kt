@@ -17,6 +17,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -26,6 +30,10 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -40,12 +48,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -78,6 +88,7 @@ import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -92,8 +103,13 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -103,8 +119,11 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.core.app.NotificationManagerCompat
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -170,6 +189,36 @@ private fun PinnedApp(resumeTick: Int) {
 
     fun persist() = Store.save(ctx, pins.toList())
 
+    // Long-press drag to reorder. The dragged card follows the finger via dragOffset and
+    // swaps places with a neighbour once its centre crosses into that neighbour.
+    val listState = rememberLazyListState()
+    val haptics = LocalHapticFeedback.current
+    var draggingId by remember { mutableStateOf<Int?>(null) }
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+
+    fun dragBy(delta: Float) {
+        dragOffset += delta
+        val items = listState.layoutInfo.visibleItemsInfo
+        val current = items.firstOrNull { it.key == draggingId } ?: return
+        val center = current.offset + dragOffset + current.size / 2f
+        val target = items.firstOrNull {
+            it.key is Int && it.key != draggingId && center.toInt() in it.offset..(it.offset + it.size)
+        } ?: return
+        val from = pins.indexOfFirst { it.id == draggingId }
+        val to = pins.indexOfFirst { it.id == target.key }
+        if (from < 0 || to < 0) return
+        pins.add(to, pins.removeAt(from))
+        // The card's slot moved; shift the offset so it stays under the finger.
+        dragOffset += current.offset - target.offset
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    fun endDrag() {
+        if (draggingId != null) persist()
+        draggingId = null
+        dragOffset = 0f
+    }
+
     fun done(pin: Pin) {
         val index = pins.indexOfFirst { it.id == pin.id }
         if (index < 0) return
@@ -229,6 +278,7 @@ private fun PinnedApp(resumeTick: Int) {
         }
     ) { padding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 20.dp,
@@ -267,9 +317,36 @@ private fun PinnedApp(resumeTick: Int) {
             }
 
             items(pins, key = { it.id }) { pin ->
+                val dragging = pin.id == draggingId
+                val lift by animateFloatAsState(if (dragging) 1f else 0f, label = "lift")
                 PinRow(
                     pin = pin,
-                    modifier = Modifier.animateItem(),
+                    dragging = dragging,
+                    modifier = Modifier
+                        .zIndex(if (dragging) 1f else 0f)
+                        .then(if (dragging) Modifier else Modifier.animateItem())
+                        .graphicsLayer {
+                            translationY = if (dragging) dragOffset else 0f
+                            scaleX = 1f + 0.03f * lift
+                            scaleY = 1f + 0.03f * lift
+                            shadowElevation = 12.dp.toPx() * lift
+                            shape = RoundedCornerShape(24.dp)
+                        }
+                        .pointerInput(pin.id) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = {
+                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    draggingId = pin.id
+                                    dragOffset = 0f
+                                },
+                                onDrag = { change, amount ->
+                                    change.consume()
+                                    dragBy(amount.y)
+                                },
+                                onDragEnd = { endDrag() },
+                                onDragCancel = { endDrag() },
+                            )
+                        },
                     checked = pin.id in completing,
                     onRequestDone = { confirming = pin },
                     onClick = { editing = pin; composerOpen = true },
@@ -371,6 +448,7 @@ private fun EmptyState() {
 private fun PinRow(
     pin: Pin,
     modifier: Modifier,
+    dragging: Boolean,
     checked: Boolean,
     onRequestDone: () -> Unit,
     onClick: () -> Unit,
@@ -388,6 +466,8 @@ private fun PinRow(
     SwipeToDismissBox(
         state = swipe,
         modifier = modifier,
+        enableDismissFromStartToEnd = !dragging,
+        enableDismissFromEndToStart = !dragging,
         backgroundContent = {
             Box(
                 Modifier.fillMaxSize().clip(shape)
@@ -512,10 +592,30 @@ private fun Composer(
             // Focus on the very first frame so the keyboard opens together with the panel.
             LaunchedEffect(Unit) { focus.requestFocus() }
 
+            // Drag the panel down to close it; a short drag springs back.
+            val scope = rememberCoroutineScope()
+            val dragY = remember { Animatable(0f) }
+            val closeDistance = with(LocalDensity.current) { 110.dp.toPx() }
+
             Surface(
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .offset { IntOffset(0, dragY.value.roundToInt()) }
+                    .draggable(
+                        orientation = Orientation.Vertical,
+                        state = rememberDraggableState { delta ->
+                            scope.launch { dragY.snapTo((dragY.value + delta).coerceAtLeast(0f)) }
+                        },
+                        onDragStopped = { velocity ->
+                            if (dragY.value > closeDistance || velocity > 1800f) {
+                                close(onDismiss)
+                            } else {
+                                dragY.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
+                            }
+                        },
+                    ),
             ) {
                 Column(
                     Modifier
@@ -524,7 +624,7 @@ private fun Composer(
                 ) {
                     Box(
                         Modifier.align(Alignment.CenterHorizontally)
-                            .size(width = 36.dp, height = 4.dp)
+                            .size(width = 40.dp, height = 5.dp)
                             .clip(CircleShape)
                             .background(MaterialTheme.colorScheme.outlineVariant)
                     )
