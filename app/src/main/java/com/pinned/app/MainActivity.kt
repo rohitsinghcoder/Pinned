@@ -38,8 +38,10 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -70,7 +72,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
@@ -92,17 +96,21 @@ import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimeInput
+import androidx.compose.material3.TimePicker
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberSwipeToDismissBoxState
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -135,8 +143,11 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.zIndex
 import androidx.core.app.NotificationManagerCompat
+import java.util.Calendar
 import java.util.Date
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
@@ -172,7 +183,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
+internal fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
     val dark = when (mode) {
         ThemeMode.System -> isSystemInDarkTheme()
         ThemeMode.Light -> false
@@ -238,16 +249,40 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
     val batteryFree = remember(resumeTick) {
         ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)
     }
+    val overlayOn = remember(resumeTick) { Reminders.canDrawOverlays(ctx) }
+    val fullScreenOn = remember(resumeTick) { Reminders.canUseFullScreenIntent(ctx) }
+    val exactAlarmsOn = remember(resumeTick) { Reminders.canScheduleExactAlarms(ctx) }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val hasActiveReminder = pins.any { it.remindAt != null && it.remindAt > nowTick }
+
+    // Keep reminder badges live (1s cadence when a timer is within 10 min, 30s otherwise).
+    LaunchedEffect(hasActiveReminder, pins.toList()) {
+        while (hasActiveReminder) {
+            val soonest = pins.mapNotNull { it.remindAt }.filter { it > nowTick }.minOrNull() ?: break
+            val interval = if (soonest - nowTick <= 10 * 60_000L) 1_000L else 30_000L
+            delay(interval)
+            nowTick = System.currentTimeMillis()
+        }
+    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33 && !notificationsOn) {
             permission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
-    // Make sure every stored pin is actually showing (e.g. after permission is granted).
-    LaunchedEffect(notificationsOn) {
-        if (notificationsOn) Notifier.showAll(ctx)
+    // Reload state on resume (e.g. if a full-screen reminder marked a pin done or snoozed it)
+    // and ensure every stored pin is actually showing.
+    LaunchedEffect(resumeTick, notificationsOn) {
+        nowTick = System.currentTimeMillis()
+        if (resumeTick > 0) {
+            pins.clear()
+            pins.addAll(Store.load(ctx))
+            history.clear()
+            history.addAll(Store.loadDone(ctx))
+        }
+        if (notificationsOn) Notifier.sync(ctx)
     }
 
     fun persist() = Store.save(ctx, pins.toList())
@@ -287,8 +322,9 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
         if (index < 0) return
         pins.removeAt(index)
         persist()
+        Reminders.cancel(ctx, pin.id)
         Notifier.cancel(ctx, pin.id)
-        history.add(0, Done(pin, System.currentTimeMillis()))
+        history.add(0, Done(pin.copy(remindAt = null), System.currentTimeMillis()))
         Store.saveDone(ctx, history.toList())
         scope.launch {
             snackbar.currentSnackbarData?.dismiss()
@@ -298,9 +334,13 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                 duration = SnackbarDuration.Short
             )
             if (result == SnackbarResult.ActionPerformed) {
-                pins.add(index.coerceAtMost(pins.size), pin)
+                val restored = if (pin.remindAt != null && pin.remindAt <= System.currentTimeMillis()) {
+                    pin.copy(remindAt = null)
+                } else pin
+                pins.add(index.coerceAtMost(pins.size), restored)
                 persist()
-                Notifier.show(ctx, pin)
+                Notifier.show(ctx, restored)
+                Reminders.schedule(ctx, restored)
                 history.removeAll { it.pin.id == pin.id }
                 Store.saveDone(ctx, history.toList())
             }
@@ -311,9 +351,10 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
     fun restore(item: Done) {
         history.remove(item)
         Store.saveDone(ctx, history.toList())
-        pins.add(0, item.pin)
+        val pin = item.pin.copy(remindAt = null)
+        pins.add(0, pin)
         persist()
-        Notifier.show(ctx, item.pin, silent = false)
+        Notifier.show(ctx, pin, silent = false)
     }
 
     // Called once the user confirms: show the check for a beat, then remove.
@@ -326,18 +367,20 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
         }
     }
 
-    fun save(title: String, note: String) {
+    fun save(title: String, note: String, remindAt: Long?) {
         val current = editing
         val pin = if (current == null) {
-            Pin(Store.nextId(ctx), title, note, System.currentTimeMillis()).also { pins.add(0, it) }
+            Pin(Store.nextId(ctx), title, note, System.currentTimeMillis(), remindAt).also { pins.add(0, it) }
         } else {
-            current.copy(title = title, note = note).also { updated ->
+            current.copy(title = title, note = note, remindAt = remindAt).also { updated ->
                 val i = pins.indexOfFirst { it.id == updated.id }
                 if (i >= 0) pins[i] = updated
             }
         }
+        nowTick = System.currentTimeMillis()
         persist()
         Notifier.show(ctx, pin, silent = current != null)
+        Reminders.schedule(ctx, pin)
     }
 
     Scaffold(
@@ -392,6 +435,51 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                         )
                     }
                 }
+            } else if (hasActiveReminder && !overlayOn) {
+                item(key = "hint-overlay") {
+                    Hint(
+                        "Full-screen while unlocked",
+                        "Allow Pinned to display over other apps so reminders take over your screen.",
+                        "Allow",
+                    ) {
+                        ctx.startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${ctx.packageName}")
+                            )
+                        )
+                    }
+                }
+            } else if (hasActiveReminder && !fullScreenOn && Build.VERSION.SDK_INT >= 34) {
+                item(key = "hint-fullscreen") {
+                    Hint(
+                        "Full-screen on lock screen",
+                        "Allow full-screen notifications so reminders wake your screen.",
+                        "Allow",
+                    ) {
+                        ctx.startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                Uri.parse("package:${ctx.packageName}")
+                            )
+                        )
+                    }
+                }
+            } else if (hasActiveReminder && !exactAlarmsOn && Build.VERSION.SDK_INT >= 31) {
+                item(key = "hint-exact") {
+                    Hint(
+                        "Exact reminder timing",
+                        "Allow exact alarms so 5–10 min timers fire right on time.",
+                        "Allow",
+                    ) {
+                        ctx.startActivity(
+                            Intent(
+                                Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                Uri.parse("package:${ctx.packageName}")
+                            )
+                        )
+                    }
+                }
             }
 
             if (pins.isEmpty()) {
@@ -403,6 +491,7 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                 val lift by animateFloatAsState(if (dragging) 1f else 0f, label = "lift")
                 PinRow(
                     pin = pin,
+                    now = nowTick,
                     dragging = dragging,
                     modifier = Modifier
                         .zIndex(if (dragging) 1f else 0f)
@@ -441,7 +530,7 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
         visible = composerOpen,
         initial = editing,
         onDismiss = { composerOpen = false },
-        onSave = { title, note -> save(title, note); composerOpen = false },
+        onSave = { title, note, remindAt -> save(title, note, remindAt); composerOpen = false },
         onRequestDone = { confirming = editing; composerOpen = false },
     )
 
@@ -786,12 +875,14 @@ private fun EmptyState() {
 @Composable
 private fun PinRow(
     pin: Pin,
+    now: Long,
     modifier: Modifier,
     dragging: Boolean,
     checked: Boolean,
     onRequestDone: () -> Unit,
     onClick: () -> Unit,
 ) {
+    val ctx = LocalContext.current
     // A full swipe only asks for confirmation; the card always springs back.
     val swipe = rememberSwipeToDismissBoxState(
         confirmValueChange = {
@@ -848,13 +939,44 @@ private fun PinRow(
                         )
                     }
                     Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Pinned " + DateUtils.getRelativeTimeSpanString(
-                            pin.created, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS
-                        ).toString().replaceFirstChar { it.lowercase() },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "Pinned " + DateUtils.getRelativeTimeSpanString(
+                                pin.created, now, DateUtils.MINUTE_IN_MILLIS
+                            ).toString().replaceFirstChar { it.lowercase() },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                        val remindAt = pin.remindAt
+                        if (remindAt != null && remindAt > now) {
+                            Surface(
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.Notifications,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.size(12.dp),
+                                    )
+                                    Text(
+                                        Reminders.formatBadge(ctx, remindAt, now),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 CheckCircle(checked) { if (!checked) onRequestDone() }
             }
@@ -887,18 +1009,26 @@ private fun CheckCircle(checked: Boolean, onClick: () -> Unit) {
     }
 }
 
+private sealed interface ReminderOption {
+    data object Off : ReminderOption
+    data class InDuration(val totalSeconds: Long, val isCustom: Boolean = false) : ReminderOption
+    data class AtTime(val millis: Long) : ReminderOption
+}
+
 /**
  * Bottom panel that rides on top of the keyboard. It lives in the activity window (not a
  * separate sheet window), so the panel and keyboard slide up together in one motion.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Composer(
     visible: Boolean,
     initial: Pin?,
     onDismiss: () -> Unit,
-    onSave: (String, String) -> Unit,
+    onSave: (String, String, Long?) -> Unit,
     onRequestDone: () -> Unit,
 ) {
+    val ctx = LocalContext.current
     val focusManager = LocalFocusManager.current
     fun close(action: () -> Unit) {
         focusManager.clearFocus()
@@ -927,6 +1057,15 @@ private fun Composer(
             // Start with the cursor after the existing text when editing.
             var title by remember { mutableStateOf(endOf(initial?.title ?: "")) }
             var note by remember { mutableStateOf(endOf(initial?.note ?: "")) }
+            var reminder by remember {
+                val existing = initial?.remindAt?.takeIf { it > System.currentTimeMillis() }
+                mutableStateOf<ReminderOption>(
+                    if (existing != null) ReminderOption.AtTime(existing) else ReminderOption.Off
+                )
+            }
+            var pickingTime by remember { mutableStateOf(false) }
+            var pickingDuration by remember { mutableStateOf(false) }
+
             val focus = remember { FocusRequester() }
             // Focus on the very first frame so the keyboard opens together with the panel.
             LaunchedEffect(Unit) { focus.requestFocus() }
@@ -935,6 +1074,12 @@ private fun Composer(
             val scope = rememberCoroutineScope()
             val dragY = remember { Animatable(0f) }
             val closeDistance = with(LocalDensity.current) { 110.dp.toPx() }
+
+            fun resolveReminder(): Long? = when (val r = reminder) {
+                ReminderOption.Off -> null
+                is ReminderOption.InDuration -> System.currentTimeMillis() + r.totalSeconds * 1_000L
+                is ReminderOption.AtTime -> r.millis.takeIf { it > System.currentTimeMillis() }
+            }
 
             Surface(
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
@@ -981,14 +1126,117 @@ private fun Composer(
                     )
                     Spacer(Modifier.height(10.dp))
                     Field(note, { note = it }, "Add a note", MaterialTheme.typography.bodyLarge)
-                    Spacer(Modifier.height(24.dp))
+                    Spacer(Modifier.height(16.dp))
+
+                    // Full-screen reminder selector
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Notifications,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = if (reminder is ReminderOption.Off) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                        )
+                        val reminderLabel = when (val r = reminder) {
+                            ReminderOption.Off -> "Full-screen reminder"
+                            is ReminderOption.InDuration -> "Full-screen in ${Reminders.formatDuration(r.totalSeconds)}"
+                            is ReminderOption.AtTime -> "Full-screen · ${Reminders.formatTarget(ctx, r.millis)}"
+                        }
+                        Text(
+                            reminderLabel,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (reminder is ReminderOption.Off) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (reminder !is ReminderOption.Off) {
+                            Icon(
+                                Icons.Rounded.Close,
+                                contentDescription = "Clear reminder",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .clickable { reminder = ReminderOption.Off },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        ReminderChip(
+                            label = "Off",
+                            selected = reminder is ReminderOption.Off,
+                            onClick = { reminder = ReminderOption.Off },
+                        )
+                        listOf(
+                            5 * 60L to "5m",
+                            10 * 60L to "10m",
+                            15 * 60L to "15m",
+                            30 * 60L to "30m",
+                            60 * 60L to "1h",
+                        ).forEach { (secs, label) ->
+                            val current = reminder as? ReminderOption.InDuration
+                            val selected = current != null && !current.isCustom && current.totalSeconds == secs
+                            ReminderChip(
+                                label = label,
+                                selected = selected,
+                                onClick = {
+                                    reminder = if (selected) ReminderOption.Off else ReminderOption.InDuration(secs)
+                                },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        val atTime = reminder as? ReminderOption.AtTime
+                        val customDur = (reminder as? ReminderOption.InDuration)?.takeIf { it.isCustom }
+                        ReminderActionPill(
+                            iconRes = R.drawable.ic_clock,
+                            label = if (atTime != null) Reminders.formatTarget(ctx, atTime.millis) else "At time",
+                            selected = atTime != null,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                focusManager.clearFocus()
+                                pickingTime = true
+                            },
+                        )
+                        ReminderActionPill(
+                            iconRes = R.drawable.ic_timer,
+                            label = if (customDur != null) "In ${Reminders.formatDuration(customDur.totalSeconds)}" else "Custom timer",
+                            selected = customDur != null,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                focusManager.clearFocus()
+                                pickingDuration = true
+                            },
+                        )
+                    }
+
+                    Spacer(Modifier.height(18.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (initial != null) {
                             TextButton(onClick = { close(onRequestDone) }) { Text("Mark done") }
                         }
                         Spacer(Modifier.weight(1f))
                         Button(
-                            onClick = { close { onSave(title.text.trim(), note.text.trim()) } },
+                            onClick = { close { onSave(title.text.trim(), note.text.trim(), resolveReminder()) } },
                             enabled = title.text.isNotBlank(),
                             shape = RoundedCornerShape(16.dp),
                             contentPadding = PaddingValues(horizontal = 28.dp, vertical = 14.dp),
@@ -998,7 +1246,335 @@ private fun Composer(
                     }
                 }
             }
+
+            if (pickingTime) {
+                SelectTimeDialog(
+                    initialMillis = (reminder as? ReminderOption.AtTime)?.millis,
+                    onDismiss = { pickingTime = false },
+                    onConfirm = { millis ->
+                        reminder = ReminderOption.AtTime(millis)
+                        pickingTime = false
+                    },
+                )
+            }
+
+            if (pickingDuration) {
+                CustomTimerDialog(
+                    initialSeconds = (reminder as? ReminderOption.InDuration)?.totalSeconds ?: 0L,
+                    onDismiss = { pickingDuration = false },
+                    onConfirm = { totalSecs ->
+                        reminder = ReminderOption.InDuration(totalSecs, isCustom = true)
+                        pickingDuration = false
+                    },
+                )
+            }
         }
+    }
+}
+
+@Composable
+private fun ReminderActionPill(
+    iconRes: Int,
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = if (selected) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        },
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                painterResource(iconRes),
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = if (selected) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Spacer(Modifier.size(6.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (selected) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** Google Clock–style time dialog: Hours -> Minutes radial dial with keyboard toggle. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SelectTimeDialog(
+    initialMillis: Long?,
+    onDismiss: () -> Unit,
+    onConfirm: (Long) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val initCal = remember(initialMillis) {
+        Calendar.getInstance().apply {
+            if (initialMillis != null) timeInMillis = initialMillis else add(Calendar.MINUTE, 10)
+        }
+    }
+    val pickerState = rememberTimePickerState(
+        initialHour = initCal.get(Calendar.HOUR_OF_DAY),
+        initialMinute = initCal.get(Calendar.MINUTE),
+        is24Hour = DateFormat.is24HourFormat(ctx),
+    )
+    var useKeyboard by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    if (useKeyboard) "Enter time" else "Select time",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+                )
+                if (useKeyboard) {
+                    TimeInput(state = pickerState)
+                } else {
+                    TimePicker(state = pickerState)
+                }
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = { useKeyboard = !useKeyboard }) {
+                        Icon(
+                            painterResource(if (useKeyboard) R.drawable.ic_clock else R.drawable.ic_keyboard),
+                            contentDescription = if (useKeyboard) "Switch to clock dial" else "Switch to keyboard input",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("Cancel") }
+                    TextButton(
+                        onClick = {
+                            val cal = Calendar.getInstance().apply {
+                                set(Calendar.HOUR_OF_DAY, pickerState.hour)
+                                set(Calendar.MINUTE, pickerState.minute)
+                                set(Calendar.SECOND, 0)
+                                set(Calendar.MILLISECOND, 0)
+                                if (timeInMillis <= System.currentTimeMillis()) {
+                                    add(Calendar.DAY_OF_YEAR, 1)
+                                }
+                            }
+                            onConfirm(cal.timeInMillis)
+                        }
+                    ) { Text("OK") }
+                }
+            }
+        }
+    }
+}
+
+/** Google Clock–style timer numpad for custom durations down to the second (e.g. 5m 15s). */
+@Composable
+private fun CustomTimerDialog(
+    initialSeconds: Long,
+    onDismiss: () -> Unit,
+    onConfirm: (Long) -> Unit,
+) {
+    val haptics = LocalHapticFeedback.current
+    var digits by remember {
+        val init = if (initialSeconds > 0L) {
+            val h = (initialSeconds / 3600).coerceAtMost(99)
+            val m = (initialSeconds % 3600) / 60
+            val s = initialSeconds % 60
+            "%02d%02d%02d".format(h, m, s).trimStart('0')
+        } else ""
+        mutableStateOf(init)
+    }
+
+    val padded = digits.padStart(6, '0')
+    val hours = padded.substring(0, 2).toLong()
+    val minutes = padded.substring(2, 4).toLong()
+    val seconds = padded.substring(4, 6).toLong()
+    val totalSeconds = hours * 3600 + minutes * 60 + seconds
+
+    fun append(d: String) {
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        val next = (digits + d).trimStart('0')
+        if (next.length <= 6) digits = next
+    }
+
+    fun backspace() {
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        if (digits.isNotEmpty()) digits = digits.dropLast(1)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    "Custom timer",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(16.dp))
+
+                // Readout: 00h  05m  15s
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.Bottom,
+                ) {
+                    DurationUnit(padded.substring(0, 2), "h", active = digits.length > 4)
+                    DurationUnit(padded.substring(2, 4), "m", active = digits.length > 2)
+                    DurationUnit(padded.substring(4, 6), "s", active = digits.isNotEmpty())
+                }
+
+                Spacer(Modifier.height(20.dp))
+
+                val rows = listOf(
+                    listOf("1", "2", "3"),
+                    listOf("4", "5", "6"),
+                    listOf("7", "8", "9"),
+                    listOf("00", "0", "⌫"),
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    rows.forEach { row ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            row.forEach { key ->
+                                val isBack = key == "⌫"
+                                Surface(
+                                    shape = CircleShape,
+                                    color = if (isBack) {
+                                        MaterialTheme.colorScheme.secondaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerHighest
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(54.dp)
+                                        .clip(CircleShape)
+                                        .clickable {
+                                            if (isBack) backspace() else append(key)
+                                        },
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            key,
+                                            style = MaterialTheme.typography.titleLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            color = if (isBack) {
+                                                MaterialTheme.colorScheme.onSecondaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurface
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(18.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onDismiss) { Text("Cancel") }
+                    Spacer(Modifier.size(4.dp))
+                    Button(
+                        onClick = { onConfirm(totalSeconds) },
+                        enabled = totalSeconds > 0L,
+                        shape = RoundedCornerShape(14.dp),
+                    ) { Text("Set") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DurationUnit(value: String, unit: String, active: Boolean) {
+    val color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+    Row(verticalAlignment = Alignment.Bottom) {
+        Text(
+            value,
+            fontSize = 36.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = color,
+        )
+        Text(
+            unit,
+            style = MaterialTheme.typography.titleMedium,
+            color = color,
+            modifier = Modifier.padding(start = 2.dp, bottom = 5.dp),
+        )
+    }
+}
+
+@Composable
+private fun ReminderChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = if (selected) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        },
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) {
+                MaterialTheme.colorScheme.onPrimaryContainer
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        )
     }
 }
 

@@ -5,7 +5,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
 
-data class Pin(val id: Int, val title: String, val note: String, val created: Long)
+data class Pin(
+    val id: Int,
+    val title: String,
+    val note: String,
+    val created: Long,
+    val remindAt: Long? = null,
+)
 
 data class Done(val pin: Pin, val doneAt: Long)
 
@@ -34,22 +40,45 @@ object Store {
         val arr = JSONArray(raw)
         return List(arr.length()) { i ->
             val o = arr.getJSONObject(i)
-            Pin(o.getInt("id"), o.getString("title"), o.optString("note"), o.getLong("created"))
+            val remindAt = if (o.has("remindAt") && !o.isNull("remindAt")) o.getLong("remindAt") else null
+            Pin(o.getInt("id"), o.getString("title"), o.optString("note"), o.getLong("created"), remindAt)
         }
     }
 
     fun save(ctx: Context, pins: List<Pin>) {
         val arr = JSONArray()
         pins.forEach {
-            arr.put(
-                JSONObject()
-                    .put("id", it.id)
-                    .put("title", it.title)
-                    .put("note", it.note)
-                    .put("created", it.created)
-            )
+            val obj = JSONObject()
+                .put("id", it.id)
+                .put("title", it.title)
+                .put("note", it.note)
+                .put("created", it.created)
+            if (it.remindAt != null) obj.put("remindAt", it.remindAt)
+            arr.put(obj)
         }
         prefs(ctx).edit().putString("items", arr.toString()).apply()
+    }
+
+    fun updateReminder(ctx: Context, pinId: Int, remindAt: Long?): Pin? {
+        val pins = load(ctx).toMutableList()
+        val idx = pins.indexOfFirst { it.id == pinId }
+        if (idx < 0) return null
+        val updated = pins[idx].copy(remindAt = remindAt)
+        pins[idx] = updated
+        save(ctx, pins)
+        return updated
+    }
+
+    fun markDone(ctx: Context, pinId: Int): Pin? {
+        val pins = load(ctx).toMutableList()
+        val idx = pins.indexOfFirst { it.id == pinId }
+        if (idx < 0) return null
+        val removed = pins.removeAt(idx).copy(remindAt = null)
+        save(ctx, pins)
+        val history = loadDone(ctx).toMutableList()
+        history.add(0, Done(removed, System.currentTimeMillis()))
+        saveDone(ctx, history)
+        return removed
     }
 
     /** Completed pins from today and yesterday; anything older is dropped. */

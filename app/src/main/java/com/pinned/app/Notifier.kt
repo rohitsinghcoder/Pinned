@@ -12,6 +12,10 @@ object Notifier {
     private const val CHANNEL = "pinned"
     const val EXTRA_ID = "id"
 
+    // OnePlus / ColorOS injects a 72h timeout (PT72H) on notifications and silently removes them
+    // without triggering deleteIntent. Silently refreshing active pins after 24h resets that clock.
+    private const val REFRESH_AFTER_MS = 24L * 60 * 60 * 1000
+
     private fun ensureChannel(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL) != null) return
@@ -55,14 +59,58 @@ object Notifier {
             builder.setContentText(pin.note)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(pin.note))
         }
+        val remindAt = pin.remindAt
+        if (remindAt != null && remindAt > System.currentTimeMillis()) {
+            builder.setSubText("Reminder · ${Reminders.formatTarget(ctx, remindAt)}")
+        }
         try {
             NotificationManagerCompat.from(ctx).notify(pin.id, builder.build())
         } catch (_: SecurityException) {
             // Notification permission not granted yet; the app shows a hint for this.
         }
+        PinWatchdog.syncSchedule(ctx)
     }
 
-    fun cancel(ctx: Context, id: Int) = NotificationManagerCompat.from(ctx).cancel(id)
+    fun cancel(ctx: Context, id: Int) {
+        NotificationManagerCompat.from(ctx).cancel(id)
+        PinWatchdog.syncSchedule(ctx)
+    }
 
-    fun showAll(ctx: Context) = Store.load(ctx).forEach { show(ctx, it) }
+    /**
+     * Reconciles active notifications with stored pins:
+     * - Re-posts any stored pin whose notification went missing (timeout, Clear All, SystemUI restart, reboot).
+     * - Silently refreshes pins posted more than 24h ago so OS auto-timeouts never expire them.
+     * - Cancels orphaned notifications that are no longer in the store.
+     */
+    fun sync(ctx: Context, skipId: Int = -1) {
+        val pins = Store.load(ctx)
+        PinWatchdog.syncSchedule(ctx, hasPins = pins.isNotEmpty())
+
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val activeById = nm.activeNotifications.associateBy { it.id }
+        val pinIds = pins.mapTo(HashSet(pins.size)) { it.id }
+
+        // Remove any lingering pin notifications for pins already deleted/completed.
+        // Leave full-screen reminder alerts (id >= Reminders.NOTIF_ID_OFFSET) untouched.
+        for (id in activeById.keys) {
+            if (id < Reminders.NOTIF_ID_OFFSET && id != skipId && id !in pinIds) {
+                nm.cancel(id)
+            }
+        }
+
+        if (!NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return
+
+        val now = System.currentTimeMillis()
+        for (pin in pins) {
+            if (pin.id == skipId) continue
+            val existing = activeById[pin.id]
+            val missing = existing == null
+            val stale = existing != null && (now - existing.postTime) >= REFRESH_AFTER_MS
+            if (missing || stale) {
+                show(ctx, pin, silent = true)
+            }
+        }
+    }
+
+    fun showAll(ctx: Context) = sync(ctx)
 }

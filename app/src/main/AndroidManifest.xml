@@ -4,6 +4,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"
@@ -24,9 +29,24 @@
             </intent-filter>
         </activity>
 
+        <!-- Full-screen timed reminder takeover -->
+        <activity
+            android:name=".ReminderActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:showOnLockScreen="true"
+            android:taskAffinity="com.pinned.app.reminder"
+            android:turnScreenOn="true" />
+
         <!-- Re-posts a pin the moment it is swiped away -->
         <receiver
             android:name=".RepostReceiver"
+            android:exported="false" />
+
+        <!-- Fires timed full-screen reminders and handles alert quick actions -->
+        <receiver
+            android:name=".ReminderReceiver"
             android:exported="false" />
 
         <!-- Restores pins after reboot or app update -->
@@ -35,8 +55,15 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- Periodic watchdog that refreshes aged pins before OS auto-timeouts clear them -->
+        <service
+            android:name=".SyncJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>
