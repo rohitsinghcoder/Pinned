@@ -31,6 +31,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -67,6 +68,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -136,11 +138,13 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -153,20 +157,34 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+private data class LaunchDraft(
+    val title: String = "",
+    val note: String = "",
+    val token: Long = System.nanoTime(),
+)
+
 class MainActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_OPEN_COMPOSER = "open_composer"
+    }
+
     // Bumped on every resume so permission / battery state is re-checked
     // after the user comes back from system settings.
     private val resumeTick = mutableIntStateOf(0)
     private val themeMode = mutableStateOf(ThemeMode.System)
+    private val launchDraft = mutableStateOf<LaunchDraft?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         themeMode.value = Store.theme(this)
+        handleIncomingIntent(intent)
         setContent {
             PinnedTheme(themeMode.value) {
                 PinnedApp(
                     resumeTick = resumeTick.intValue,
                     theme = themeMode.value,
+                    launchDraft = launchDraft.value,
+                    onDraftConsumed = { launchDraft.value = null },
                     onTheme = {
                         themeMode.value = it
                         Store.setTheme(this, it)
@@ -176,11 +194,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
     override fun onResume() {
         super.onResume()
         resumeTick.intValue++
     }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+            val shared = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
+            val subject = intent.getStringExtra(Intent.EXTRA_SUBJECT)?.trim().orEmpty()
+            if (shared.isNotEmpty() || subject.isNotEmpty()) {
+                val (title, note) = if (subject.isNotEmpty()) {
+                    subject to shared
+                } else {
+                    val lines = shared.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                    (lines.firstOrNull() ?: shared) to lines.drop(1).joinToString("\n")
+                }
+                launchDraft.value = LaunchDraft(title = title, note = note)
+            }
+            intent.action = null
+            return
+        }
+        if (intent.getBooleanExtra(EXTRA_OPEN_COMPOSER, false)) {
+            launchDraft.value = LaunchDraft()
+            intent.removeExtra(EXTRA_OPEN_COMPOSER)
+        }
+    }
 }
+
+/**
+ * Keeps bottom controls comfortably clear of deep display corners (e.g. OnePlus 15's ~59dp corner
+ * radius) even when the system gesture navigation bar is hidden (0dp inset).
+ */
+@Composable
+internal fun bottomSafePadding(): Dp =
+    WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding().coerceAtLeast(24.dp)
+
+@Composable
+internal fun surfaceHairline(theme: ThemeMode): Color =
+    if (theme == ThemeMode.Amoled) Color(0xFF252525)
+    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
 
 @Composable
 internal fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
@@ -207,12 +267,14 @@ internal fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
     ) else base
 
     // Keep status/navigation bar icons readable when the app theme differs from the system's.
-    val activity = LocalContext.current as ComponentActivity
-    DisposableEffect(dark) {
-        val transparent = android.graphics.Color.TRANSPARENT
-        val style = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
-        activity.enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
-        onDispose {}
+    val activity = LocalContext.current as? ComponentActivity
+    if (activity != null) {
+        DisposableEffect(dark) {
+            val transparent = android.graphics.Color.TRANSPARENT
+            val style = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
+            activity.enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+            onDispose {}
+        }
     }
 
     val animated = scheme.copy(
@@ -228,7 +290,13 @@ internal fun PinnedTheme(mode: ThemeMode, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) -> Unit) {
+private fun PinnedApp(
+    resumeTick: Int,
+    theme: ThemeMode,
+    launchDraft: LaunchDraft?,
+    onDraftConsumed: () -> Unit,
+    onTheme: (ThemeMode) -> Unit,
+) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
@@ -238,10 +306,22 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
     var appearanceOpen by remember { mutableStateOf(false) }
     var composerOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Pin?>(null) }
+    var draftPrefill by remember { mutableStateOf<LaunchDraft?>(null) }
+    var quickTimerPin by remember { mutableStateOf<Pin?>(null) }
     // Pin waiting for the "Mark as done?" confirmation.
     var confirming by remember { mutableStateOf<Pin?>(null) }
     // Pins confirmed as done, briefly showing their check before they leave the list.
     val completing = remember { mutableStateListOf<Int>() }
+
+    LaunchedEffect(launchDraft) {
+        if (launchDraft != null) {
+            editing = null
+            draftPrefill = launchDraft
+            historyOpen = false
+            composerOpen = true
+            onDraftConsumed()
+        }
+    }
 
     val notificationsOn = remember(resumeTick) {
         NotificationManagerCompat.from(ctx).areNotificationsEnabled()
@@ -383,14 +463,30 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
         Reminders.schedule(ctx, pin)
     }
 
+    fun updatePinReminder(pin: Pin, remindAt: Long?) {
+        val updated = pin.copy(remindAt = remindAt)
+        val i = pins.indexOfFirst { it.id == pin.id }
+        if (i >= 0) pins[i] = updated
+        nowTick = System.currentTimeMillis()
+        persist()
+        Notifier.show(ctx, updated, silent = true)
+        Reminders.schedule(ctx, updated)
+    }
+
+    val bottomSafe = bottomSafePadding()
+    val hairline = surfaceHairline(theme)
+    val timedCount = pins.count { it.remindAt != null && it.remindAt > nowTick }
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surface,
-        snackbarHost = { SnackbarHost(snackbar) },
+        snackbarHost = { SnackbarHost(snackbar, modifier = Modifier.padding(bottom = bottomSafe)) },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { editing = null; composerOpen = true },
+                onClick = { editing = null; draftPrefill = null; composerOpen = true },
                 shape = RoundedCornerShape(20.dp),
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.padding(bottom = (bottomSafe - 16.dp).coerceAtLeast(0.dp)),
             ) {
                 Icon(Icons.Rounded.Add, contentDescription = "Pin something")
             }
@@ -403,13 +499,14 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                 start = 20.dp,
                 end = 20.dp,
                 top = padding.calculateTopPadding() + 24.dp,
-                bottom = padding.calculateBottomPadding() + 104.dp,
+                bottom = bottomSafe + 104.dp,
             ),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item(key = "header") {
                 Header(
-                    pins.size,
+                    count = pins.size,
+                    timedCount = timedCount,
                     onDoneHistory = { historyOpen = true },
                     onAppearance = { appearanceOpen = true },
                 )
@@ -492,6 +589,7 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                 PinRow(
                     pin = pin,
                     now = nowTick,
+                    hairline = hairline,
                     dragging = dragging,
                     modifier = Modifier
                         .zIndex(if (dragging) 1f else 0f)
@@ -501,7 +599,7 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                             scaleX = 1f + 0.03f * lift
                             scaleY = 1f + 0.03f * lift
                             shadowElevation = 12.dp.toPx() * lift
-                            shape = RoundedCornerShape(24.dp)
+                            shape = RoundedCornerShape(26.dp)
                         }
                         .pointerInput(pin.id) {
                             detectDragGesturesAfterLongPress(
@@ -520,7 +618,8 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
                         },
                     checked = pin.id in completing,
                     onRequestDone = { confirming = pin },
-                    onClick = { editing = pin; composerOpen = true },
+                    onReminderClick = { quickTimerPin = pin },
+                    onClick = { editing = pin; draftPrefill = null; composerOpen = true },
                 )
             }
         }
@@ -529,10 +628,27 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
     Composer(
         visible = composerOpen,
         initial = editing,
-        onDismiss = { composerOpen = false },
-        onSave = { title, note, remindAt -> save(title, note, remindAt); composerOpen = false },
-        onRequestDone = { confirming = editing; composerOpen = false },
+        draft = draftPrefill,
+        hairline = hairline,
+        onDismiss = { composerOpen = false; draftPrefill = null },
+        onSave = { title, note, remindAt ->
+            save(title, note, remindAt)
+            composerOpen = false
+            draftPrefill = null
+        },
+        onRequestDone = { confirming = editing; composerOpen = false; draftPrefill = null },
     )
+
+    quickTimerPin?.let { pin ->
+        QuickReminderDialog(
+            pin = pin,
+            onUpdate = { target ->
+                updatePinReminder(pin, target)
+                quickTimerPin = null
+            },
+            onDismiss = { quickTimerPin = null },
+        )
+    }
 
     confirming?.let { pin ->
         ConfirmDone(
@@ -552,12 +668,17 @@ private fun PinnedApp(resumeTick: Int, theme: ThemeMode, onTheme: (ThemeMode) ->
         exit = slideOutHorizontally { it } + fadeOut(),
     ) {
         BackHandler { historyOpen = false }
-        HistoryScreen(history, onBack = { historyOpen = false }, onRestore = { restore(it) })
+        HistoryScreen(
+            history = history,
+            hairline = hairline,
+            onBack = { historyOpen = false },
+            onRestore = { restore(it) },
+        )
     }
 }
 
 @Composable
-private fun Header(count: Int, onDoneHistory: () -> Unit, onAppearance: () -> Unit) {
+private fun Header(count: Int, timedCount: Int, onDoneHistory: () -> Unit, onAppearance: () -> Unit) {
     Row(Modifier.padding(start = 4.dp, top = 24.dp, bottom = 14.dp)) {
         Column(Modifier.weight(1f)) {
             Text(
@@ -566,13 +687,19 @@ private fun Header(count: Int, onDoneHistory: () -> Unit, onAppearance: () -> Un
                 fontWeight = FontWeight.SemiBold,
             )
             Spacer(Modifier.height(4.dp))
-            AnimatedContent(count, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "count") { n ->
+            AnimatedContent(
+                targetState = count to timedCount,
+                transitionSpec = { fadeIn() togetherWith fadeOut() },
+                label = "count",
+            ) { (n, timed) ->
+                val base = when (n) {
+                    0 -> "Nothing on your mind"
+                    1 -> "1 thing to remember"
+                    else -> "$n things to remember"
+                }
+                val subtitle = if (timed > 0) "$base · $timed timed" else base
                 Text(
-                    when (n) {
-                        0 -> "Nothing on your mind"
-                        1 -> "1 thing to remember"
-                        else -> "$n things to remember"
-                    },
+                    subtitle,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -590,8 +717,14 @@ private fun Header(count: Int, onDoneHistory: () -> Unit, onAppearance: () -> Un
                 containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             ) {
                 DropdownMenuItem(
-                    text = { Text("Done") },
-                    leadingIcon = { Icon(Icons.Rounded.Check, contentDescription = null) },
+                    text = { Text("History") },
+                    leadingIcon = {
+                        Icon(
+                            painterResource(R.drawable.ic_clock),
+                            contentDescription = null,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    },
                     onClick = { menuOpen = false; onDoneHistory() },
                 )
                 DropdownMenuItem(
@@ -673,10 +806,20 @@ private fun ThemeSwatch(mode: ThemeMode) {
 }
 
 @Composable
-private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (Done) -> Unit) {
+private fun HistoryScreen(
+    history: List<Done>,
+    hairline: Color,
+    onBack: () -> Unit,
+    onRestore: (Done) -> Unit,
+) {
     val today = startOfDay(0)
+    val yesterday = startOfDay(1)
+    val thisWeek = startOfDay(6)
     val todayItems = history.filter { it.doneAt >= today }
-    val yesterdayItems = history.filter { it.doneAt < today }
+    val yesterdayItems = history.filter { it.doneAt in yesterday until today }
+    val weekItems = history.filter { it.doneAt in thisWeek until yesterday }
+    val earlierItems = history.filter { it.doneAt < thisWeek }
+    val bottomSafe = bottomSafePadding()
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
         LazyColumn(
@@ -684,7 +827,7 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
                 start = 20.dp,
                 end = 20.dp,
                 top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
-                bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 24.dp,
+                bottom = bottomSafe + 24.dp,
             ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
@@ -695,16 +838,16 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
                     }
                     Column(Modifier.padding(start = 4.dp, top = 12.dp, bottom = 14.dp)) {
                         Text(
-                            "Done",
+                            "History",
                             style = MaterialTheme.typography.displaySmall,
                             fontWeight = FontWeight.SemiBold,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
                             when (todayItems.size) {
-                                0 -> "Nothing finished today yet"
-                                1 -> "1 thing finished today"
-                                else -> "${todayItems.size} things finished today"
+                                0 -> "Nothing completed today yet"
+                                1 -> "1 pin completed today"
+                                else -> "${todayItems.size} pins completed today"
                             },
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -725,17 +868,17 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                Icons.Rounded.Check,
+                                painterResource(R.drawable.ic_clock),
                                 contentDescription = null,
                                 modifier = Modifier.size(36.dp),
                                 tint = MaterialTheme.colorScheme.onSecondaryContainer,
                             )
                         }
                         Spacer(Modifier.height(20.dp))
-                        Text("Nothing done yet", style = MaterialTheme.typography.titleMedium)
+                        Text("No history yet", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "Things you finish today and\nyesterday will show up here.",
+                            "Pins you complete are kept here\nfor 60 days.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
@@ -744,7 +887,12 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
                 }
             }
 
-            listOf("Today" to todayItems, "Yesterday" to yesterdayItems).forEach { (label, items) ->
+            listOf(
+                "Today" to todayItems,
+                "Yesterday" to yesterdayItems,
+                "This week" to weekItems,
+                "Earlier" to earlierItems,
+            ).forEach { (label, items) ->
                 if (items.isNotEmpty()) {
                     item(key = "label-$label") {
                         Text(
@@ -755,7 +903,9 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
                         )
                     }
                     items(items, key = { "done-${it.pin.id}-${it.doneAt}" }) { item ->
-                        DoneRow(item, Modifier.animateItem()) { onRestore(item) }
+                        DoneRow(item, hairline, showDate = item.doneAt < yesterday, Modifier.animateItem()) {
+                            onRestore(item)
+                        }
                     }
                 }
             }
@@ -764,11 +914,18 @@ private fun HistoryScreen(history: List<Done>, onBack: () -> Unit, onRestore: (D
 }
 
 @Composable
-private fun DoneRow(item: Done, modifier: Modifier, onRestore: () -> Unit) {
+private fun DoneRow(
+    item: Done,
+    hairline: Color,
+    showDate: Boolean,
+    modifier: Modifier,
+    onRestore: () -> Unit,
+) {
     val ctx = LocalContext.current
     Surface(
-        shape = RoundedCornerShape(24.dp),
+        shape = RoundedCornerShape(26.dp),
         color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(1.dp, hairline),
         modifier = modifier.fillMaxWidth(),
     ) {
         Row(
@@ -806,8 +963,19 @@ private fun DoneRow(item: Done, modifier: Modifier, onRestore: () -> Unit) {
                     )
                 }
                 Spacer(Modifier.height(6.dp))
+                val timeStr = DateFormat.getTimeFormat(ctx).format(Date(item.doneAt))
+                val timestamp = if (showDate) {
+                    val dateStr = DateUtils.formatDateTime(
+                        ctx,
+                        item.doneAt,
+                        DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH,
+                    )
+                    "$dateStr · $timeStr"
+                } else {
+                    "Completed at $timeStr"
+                }
                 Text(
-                    "Done at " + DateFormat.getTimeFormat(ctx).format(Date(item.doneAt)),
+                    timestamp,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
@@ -871,15 +1039,33 @@ private fun EmptyState() {
     }
 }
 
+/** Human-friendly relative timestamp that avoids awkward "0 minutes ago". */
+internal fun formatPinnedAgo(created: Long, now: Long): String {
+    val diffMs = (now - created).coerceAtLeast(0L)
+    val mins = diffMs / 60_000L
+    val hours = mins / 60L
+    return when {
+        mins < 1L -> "Just now"
+        mins < 60L -> "${mins}m ago"
+        hours < 24L -> "${hours}h ago"
+        created >= startOfDay(1) -> "Yesterday"
+        else -> DateUtils.getRelativeTimeSpanString(
+            created, now, DateUtils.DAY_IN_MILLIS, DateUtils.FORMAT_ABBREV_MONTH
+        ).toString()
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PinRow(
     pin: Pin,
     now: Long,
+    hairline: Color,
     modifier: Modifier,
     dragging: Boolean,
     checked: Boolean,
     onRequestDone: () -> Unit,
+    onReminderClick: () -> Unit,
     onClick: () -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -891,7 +1077,11 @@ private fun PinRow(
         },
         positionalThreshold = { width -> width * 0.55f },
     )
-    val shape = RoundedCornerShape(24.dp)
+    val shape = RoundedCornerShape(26.dp)
+    val borderColor by animateColorAsState(
+        targetValue = if (dragging) MaterialTheme.colorScheme.primary else hairline,
+        label = "cardBorder",
+    )
 
     SwipeToDismissBox(
         state = swipe,
@@ -914,6 +1104,7 @@ private fun PinRow(
             onClick = onClick,
             shape = shape,
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            border = BorderStroke(if (dragging) 1.5.dp else 1.dp, borderColor),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
@@ -924,12 +1115,13 @@ private fun PinRow(
                     Text(
                         pin.title,
                         style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Medium,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         textDecoration = if (checked) TextDecoration.LineThrough else null,
                     )
                     if (pin.note.isNotBlank()) {
-                        Spacer(Modifier.height(2.dp))
+                        Spacer(Modifier.height(3.dp))
                         Text(
                             pin.note,
                             style = MaterialTheme.typography.bodyMedium,
@@ -938,15 +1130,13 @@ private fun PinRow(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
-                            "Pinned " + DateUtils.getRelativeTimeSpanString(
-                                pin.created, now, DateUtils.MINUTE_IN_MILLIS
-                            ).toString().replaceFirstChar { it.lowercase() },
+                            formatPinnedAgo(pin.created, now),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.outline,
                         )
@@ -954,7 +1144,10 @@ private fun PinRow(
                         if (remindAt != null && remindAt > now) {
                             Surface(
                                 shape = CircleShape,
-                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.78f),
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .clickable(onClick = onReminderClick),
                             ) {
                                 Row(
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -963,14 +1156,14 @@ private fun PinRow(
                                 ) {
                                     Icon(
                                         Icons.Rounded.Notifications,
-                                        contentDescription = null,
+                                        contentDescription = "Edit reminder",
                                         tint = MaterialTheme.colorScheme.onPrimaryContainer,
                                         modifier = Modifier.size(12.dp),
                                     )
                                     Text(
                                         Reminders.formatBadge(ctx, remindAt, now),
                                         style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Medium,
+                                        fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                                     )
                                 }
@@ -1024,6 +1217,8 @@ private sealed interface ReminderOption {
 private fun Composer(
     visible: Boolean,
     initial: Pin?,
+    draft: LaunchDraft?,
+    hairline: Color,
     onDismiss: () -> Unit,
     onSave: (String, String, Long?) -> Unit,
     onRequestDone: () -> Unit,
@@ -1039,7 +1234,7 @@ private fun Composer(
         AnimatedVisibility(visible, enter = fadeIn(), exit = fadeOut()) {
             Box(
                 Modifier.fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f))
+                    .background(Color.Black.copy(alpha = 0.5f))
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -1054,10 +1249,14 @@ private fun Composer(
         ) {
             BackHandler { close(onDismiss) }
 
-            // Start with the cursor after the existing text when editing.
-            var title by remember { mutableStateOf(endOf(initial?.title ?: "")) }
-            var note by remember { mutableStateOf(endOf(initial?.note ?: "")) }
-            var reminder by remember {
+            // Start with the cursor after the existing text when editing or sharing into Pinned.
+            var title by remember(initial?.id, draft?.token) {
+                mutableStateOf(endOf(initial?.title ?: draft?.title ?: ""))
+            }
+            var note by remember(initial?.id, draft?.token) {
+                mutableStateOf(endOf(initial?.note ?: draft?.note ?: ""))
+            }
+            var reminder by remember(initial?.id, draft?.token) {
                 val existing = initial?.remindAt?.takeIf { it > System.currentTimeMillis() }
                 mutableStateOf<ReminderOption>(
                     if (existing != null) ReminderOption.AtTime(existing) else ReminderOption.Off
@@ -1066,9 +1265,10 @@ private fun Composer(
             var pickingTime by remember { mutableStateOf(false) }
             var pickingDuration by remember { mutableStateOf(false) }
 
-            val focus = remember { FocusRequester() }
+            val titleFocus = remember { FocusRequester() }
+            val noteFocus = remember { FocusRequester() }
             // Focus on the very first frame so the keyboard opens together with the panel.
-            LaunchedEffect(Unit) { focus.requestFocus() }
+            LaunchedEffect(Unit) { titleFocus.requestFocus() }
 
             // Drag the panel down to close it; a short drag springs back.
             val scope = rememberCoroutineScope()
@@ -1082,8 +1282,9 @@ private fun Composer(
             }
 
             Surface(
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
+                border = BorderStroke(1.dp, hairline),
                 modifier = Modifier
                     .fillMaxWidth()
                     .offset { IntOffset(0, dragY.value.roundToInt()) }
@@ -1104,7 +1305,7 @@ private fun Composer(
                 Column(
                     Modifier
                         .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-                        .padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 16.dp)
+                        .padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 18.dp)
                 ) {
                     Box(
                         Modifier.align(Alignment.CenterHorizontally)
@@ -1120,12 +1321,22 @@ private fun Composer(
                     )
                     Spacer(Modifier.height(10.dp))
                     Field(
-                        title, { title = it }, "What should you remember?",
-                        MaterialTheme.typography.headlineSmall,
-                        Modifier.focusRequester(focus),
+                        value = title,
+                        onChange = { title = it },
+                        placeholder = "What should you remember?",
+                        style = MaterialTheme.typography.headlineSmall,
+                        modifier = Modifier.focusRequester(titleFocus),
+                        imeAction = ImeAction.Next,
+                        onImeAction = { noteFocus.requestFocus() },
                     )
                     Spacer(Modifier.height(10.dp))
-                    Field(note, { note = it }, "Add a note", MaterialTheme.typography.bodyLarge)
+                    Field(
+                        value = note,
+                        onChange = { note = it },
+                        placeholder = "Add a note",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.focusRequester(noteFocus),
+                    )
                     Spacer(Modifier.height(16.dp))
 
                     // Full-screen reminder selector
@@ -1172,14 +1383,13 @@ private fun Composer(
                     }
                     Spacer(Modifier.height(8.dp))
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         ReminderChip(
                             label = "Off",
                             selected = reminder is ReminderOption.Off,
+                            modifier = Modifier.weight(1f),
                             onClick = { reminder = ReminderOption.Off },
                         )
                         listOf(
@@ -1194,6 +1404,7 @@ private fun Composer(
                             ReminderChip(
                                 label = label,
                                 selected = selected,
+                                modifier = Modifier.weight(1f),
                                 onClick = {
                                     reminder = if (selected) ReminderOption.Off else ReminderOption.InDuration(secs)
                                 },
@@ -1324,9 +1535,20 @@ private fun ReminderActionPill(
 }
 
 /** Google Clock–style time dialog: Hours -> Minutes radial dial with keyboard toggle. */
+@Composable
+internal fun SelectTimeDialog(
+    initialMillis: Long?,
+    onDismiss: () -> Unit,
+    onConfirm: (Long) -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        SelectTimeCard(initialMillis = initialMillis, onDismiss = onDismiss, onConfirm = onConfirm)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SelectTimeDialog(
+internal fun SelectTimeCard(
     initialMillis: Long?,
     onDismiss: () -> Unit,
     onConfirm: (Long) -> Unit,
@@ -1344,57 +1566,55 @@ private fun SelectTimeDialog(
     )
     var useKeyboard by remember { mutableStateOf(false) }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            tonalElevation = 6.dp,
-            modifier = Modifier.fillMaxWidth(),
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Column(
-                modifier = Modifier.padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            Text(
+                if (useKeyboard) "Enter time" else "Select time",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+            )
+            if (useKeyboard) {
+                TimeInput(state = pickerState)
+            } else {
+                TimePicker(state = pickerState)
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    if (useKeyboard) "Enter time" else "Select time",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
-                )
-                if (useKeyboard) {
-                    TimeInput(state = pickerState)
-                } else {
-                    TimePicker(state = pickerState)
+                IconButton(onClick = { useKeyboard = !useKeyboard }) {
+                    Icon(
+                        painterResource(if (useKeyboard) R.drawable.ic_clock else R.drawable.ic_keyboard),
+                        contentDescription = if (useKeyboard) "Switch to clock dial" else "Switch to keyboard input",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = { useKeyboard = !useKeyboard }) {
-                        Icon(
-                            painterResource(if (useKeyboard) R.drawable.ic_clock else R.drawable.ic_keyboard),
-                            contentDescription = if (useKeyboard) "Switch to clock dial" else "Switch to keyboard input",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    TextButton(onClick = onDismiss) { Text("Cancel") }
-                    TextButton(
-                        onClick = {
-                            val cal = Calendar.getInstance().apply {
-                                set(Calendar.HOUR_OF_DAY, pickerState.hour)
-                                set(Calendar.MINUTE, pickerState.minute)
-                                set(Calendar.SECOND, 0)
-                                set(Calendar.MILLISECOND, 0)
-                                if (timeInMillis <= System.currentTimeMillis()) {
-                                    add(Calendar.DAY_OF_YEAR, 1)
-                                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+                TextButton(
+                    onClick = {
+                        val cal = Calendar.getInstance().apply {
+                            set(Calendar.HOUR_OF_DAY, pickerState.hour)
+                            set(Calendar.MINUTE, pickerState.minute)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                            if (timeInMillis <= System.currentTimeMillis()) {
+                                add(Calendar.DAY_OF_YEAR, 1)
                             }
-                            onConfirm(cal.timeInMillis)
                         }
-                    ) { Text("OK") }
-                }
+                        onConfirm(cal.timeInMillis)
+                    }
+                ) { Text("OK") }
             }
         }
     }
@@ -1402,7 +1622,18 @@ private fun SelectTimeDialog(
 
 /** Google Clock–style timer numpad for custom durations down to the second (e.g. 5m 15s). */
 @Composable
-private fun CustomTimerDialog(
+internal fun CustomTimerDialog(
+    initialSeconds: Long,
+    onDismiss: () -> Unit,
+    onConfirm: (Long) -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        CustomTimerCard(initialSeconds = initialSeconds, onDismiss = onDismiss, onConfirm = onConfirm)
+    }
+}
+
+@Composable
+internal fun CustomTimerCard(
     initialSeconds: Long,
     onDismiss: () -> Unit,
     onConfirm: (Long) -> Unit,
@@ -1435,98 +1666,96 @@ private fun CustomTimerDialog(
         if (digits.isNotEmpty()) digits = digits.dropLast(1)
     }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh,
-            tonalElevation = 6.dp,
-            modifier = Modifier.fillMaxWidth(),
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Column(
-                modifier = Modifier.padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            Text(
+                "Custom timer",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(16.dp))
+
+            // Readout: 00h  05m  15s
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.Bottom,
             ) {
-                Text(
-                    "Custom timer",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(16.dp))
+                DurationUnit(padded.substring(0, 2), "h", active = digits.length > 4)
+                DurationUnit(padded.substring(2, 4), "m", active = digits.length > 2)
+                DurationUnit(padded.substring(4, 6), "s", active = digits.isNotEmpty())
+            }
 
-                // Readout: 00h  05m  15s
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.Bottom,
-                ) {
-                    DurationUnit(padded.substring(0, 2), "h", active = digits.length > 4)
-                    DurationUnit(padded.substring(2, 4), "m", active = digits.length > 2)
-                    DurationUnit(padded.substring(4, 6), "s", active = digits.isNotEmpty())
-                }
+            Spacer(Modifier.height(20.dp))
 
-                Spacer(Modifier.height(20.dp))
-
-                val rows = listOf(
-                    listOf("1", "2", "3"),
-                    listOf("4", "5", "6"),
-                    listOf("7", "8", "9"),
-                    listOf("00", "0", "⌫"),
-                )
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    rows.forEach { row ->
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            row.forEach { key ->
-                                val isBack = key == "⌫"
-                                Surface(
-                                    shape = CircleShape,
-                                    color = if (isBack) {
-                                        MaterialTheme.colorScheme.secondaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceContainerHighest
+            val rows = listOf(
+                listOf("1", "2", "3"),
+                listOf("4", "5", "6"),
+                listOf("7", "8", "9"),
+                listOf("00", "0", "⌫"),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                rows.forEach { row ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        row.forEach { key ->
+                            val isBack = key == "⌫"
+                            Surface(
+                                shape = CircleShape,
+                                color = if (isBack) {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainerHighest
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(54.dp)
+                                    .clip(CircleShape)
+                                    .clickable {
+                                        if (isBack) backspace() else append(key)
                                     },
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(54.dp)
-                                        .clip(CircleShape)
-                                        .clickable {
-                                            if (isBack) backspace() else append(key)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        key,
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Medium,
+                                        color = if (isBack) {
+                                            MaterialTheme.colorScheme.onSecondaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
                                         },
-                                ) {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        Text(
-                                            key,
-                                            style = MaterialTheme.typography.titleLarge,
-                                            fontWeight = FontWeight.Medium,
-                                            color = if (isBack) {
-                                                MaterialTheme.colorScheme.onSecondaryContainer
-                                            } else {
-                                                MaterialTheme.colorScheme.onSurface
-                                            },
-                                        )
-                                    }
+                                    )
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                Spacer(Modifier.height(18.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    TextButton(onClick = onDismiss) { Text("Cancel") }
-                    Spacer(Modifier.size(4.dp))
-                    Button(
-                        onClick = { onConfirm(totalSeconds) },
-                        enabled = totalSeconds > 0L,
-                        shape = RoundedCornerShape(14.dp),
-                    ) { Text("Set") }
-                }
+            Spacer(Modifier.height(18.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+                Spacer(Modifier.size(4.dp))
+                Button(
+                    onClick = { onConfirm(totalSeconds) },
+                    enabled = totalSeconds > 0L,
+                    shape = RoundedCornerShape(14.dp),
+                ) { Text("Set") }
             }
         }
     }
@@ -1552,7 +1781,12 @@ private fun DurationUnit(value: String, unit: String, active: Boolean) {
 }
 
 @Composable
-private fun ReminderChip(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun ReminderChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = if (selected) {
@@ -1560,7 +1794,7 @@ private fun ReminderChip(label: String, selected: Boolean, onClick: () -> Unit) 
         } else {
             MaterialTheme.colorScheme.surfaceContainerHigh
         },
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick),
     ) {
@@ -1568,14 +1802,110 @@ private fun ReminderChip(label: String, selected: Boolean, onClick: () -> Unit) 
             label,
             style = MaterialTheme.typography.labelLarge,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
             color = if (selected) {
                 MaterialTheme.colorScheme.onPrimaryContainer
             } else {
                 MaterialTheme.colorScheme.onSurfaceVariant
             },
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 9.dp),
         )
     }
+}
+
+@Composable
+private fun QuickReminderDialog(
+    pin: Pin,
+    onUpdate: (Long?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    var pickingTime by remember { mutableStateOf(false) }
+    var pickingDuration by remember { mutableStateOf(false) }
+
+    if (pickingTime) {
+        SelectTimeDialog(
+            initialMillis = pin.remindAt?.takeIf { it > System.currentTimeMillis() },
+            onDismiss = { pickingTime = false },
+            onConfirm = { onUpdate(it) },
+        )
+        return
+    }
+    if (pickingDuration) {
+        CustomTimerDialog(
+            initialSeconds = 0L,
+            onDismiss = { pickingDuration = false },
+            onConfirm = { secs -> onUpdate(System.currentTimeMillis() + secs * 1_000L) },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Change reminder") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    pin.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    listOf(5 to "5m", 10 to "10m", 15 to "15m", 30 to "30m").forEach { (mins, label) ->
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(14.dp))
+                                .clickable { onUpdate(System.currentTimeMillis() + mins * 60_000L) },
+                        ) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.labelLarge,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(vertical = 10.dp),
+                            )
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    ReminderActionPill(
+                        iconRes = R.drawable.ic_clock,
+                        label = "At time",
+                        selected = false,
+                        modifier = Modifier.weight(1f),
+                        onClick = { pickingTime = true },
+                    )
+                    ReminderActionPill(
+                        iconRes = R.drawable.ic_timer,
+                        label = "Custom",
+                        selected = false,
+                        modifier = Modifier.weight(1f),
+                        onClick = { pickingDuration = true },
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = {
+            if (pin.remindAt != null) {
+                TextButton(onClick = { onUpdate(null) }) { Text("Turn off") }
+            }
+        },
+        shape = RoundedCornerShape(28.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+    )
 }
 
 @Composable
@@ -1611,6 +1941,8 @@ private fun Field(
     placeholder: String,
     style: TextStyle,
     modifier: Modifier = Modifier,
+    imeAction: ImeAction = ImeAction.Default,
+    onImeAction: (() -> Unit)? = null,
 ) {
     BasicTextField(
         value = value,
@@ -1618,7 +1950,14 @@ private fun Field(
         modifier = modifier.fillMaxWidth(),
         textStyle = style.copy(color = MaterialTheme.colorScheme.onSurface),
         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+        keyboardOptions = KeyboardOptions(
+            capitalization = KeyboardCapitalization.Sentences,
+            imeAction = imeAction,
+        ),
+        keyboardActions = KeyboardActions(
+            onNext = { onImeAction?.invoke() },
+            onDone = { onImeAction?.invoke() },
+        ),
         decorationBox = { inner ->
             Box {
                 if (value.text.isEmpty()) {

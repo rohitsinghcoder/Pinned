@@ -27,6 +27,11 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
         </activity>
 
         <!-- Full-screen timed reminder takeover -->
@@ -60,10 +65,27 @@
             </intent-filter>
         </receiver>
 
+        <!-- Full-screen overlay service for unlocked takeover over any app -->
+        <service
+            android:name=".ReminderOverlayService"
+            android:exported="false" />
+
         <!-- Periodic watchdog that refreshes aged pins before OS auto-timeouts clear them -->
         <service
             android:name=".SyncJobService"
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- Quick Settings tile to pin a thought from anywhere in 1 tap -->
+        <service
+            android:name=".QuickPinTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_pin"
+            android:label="Pinned"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -81,11 +81,11 @@ object Store {
         return removed
     }
 
-    /** Completed pins from today and yesterday; anything older is dropped. */
+    /** Completed pins from the last 60 days (~2 months); anything older is dropped. */
     fun loadDone(ctx: Context): List<Done> {
         val raw = prefs(ctx).getString("done", null) ?: return emptyList()
         val arr = JSONArray(raw)
-        val cutoff = startOfDay(1)
+        val cutoff = startOfDay(60)
         return List(arr.length()) { i ->
             val o = arr.getJSONObject(i)
             Done(
@@ -96,8 +96,9 @@ object Store {
     }
 
     fun saveDone(ctx: Context, done: List<Done>) {
+        val cutoff = startOfDay(60)
         val arr = JSONArray()
-        done.forEach {
+        done.filter { it.doneAt >= cutoff }.forEach {
             arr.put(
                 JSONObject()
                     .put("id", it.pin.id)

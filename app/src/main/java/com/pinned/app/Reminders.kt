@@ -1,6 +1,7 @@
 package com.pinned.app
 
 import android.app.AlarmManager
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -20,8 +21,6 @@ object Reminders {
     private const val CHANNEL = "pinned_reminder_v2"
     const val NOTIF_ID_OFFSET = 1_000_000
     const val ACTION_FIRE = "com.pinned.app.ACTION_REMINDER_FIRE"
-    const val ACTION_SNOOZE_5M = "com.pinned.app.ACTION_REMINDER_SNOOZE_5M"
-    const val ACTION_DONE = "com.pinned.app.ACTION_REMINDER_DONE"
     const val EXTRA_PIN_ID = "pin_id"
     private const val MISSED_WINDOW_MS = 12L * 60 * 60 * 1000
 
@@ -116,10 +115,24 @@ object Reminders {
         Notifier.show(ctx, cleared, silent = true)
 
         val pm = ctx.getSystemService(PowerManager::class.java)
+        val km = ctx.getSystemService(KeyguardManager::class.java)
         val wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pinned:ReminderWake")
         wakeLock.acquire(5_000L)
 
         try {
+            val unlocked = pm.isInteractive && !km.isKeyguardLocked
+            // While unlocked with overlay permission, display full-screen overlay directly over
+            // any active app (avoids ColorOS background-launch blocks and redundant banners).
+            if (unlocked && canDrawOverlays(ctx)) {
+                try {
+                    ctx.startService(
+                        Intent(ctx, ReminderOverlayService::class.java).putExtra(EXTRA_PIN_ID, cleared.id)
+                    )
+                    return
+                } catch (_: Exception) {
+                }
+            }
+
             ensureChannel(ctx)
             val fullScreenIntent = Intent(ctx, ReminderActivity::class.java).apply {
                 putExtra(EXTRA_PIN_ID, cleared.id)
@@ -135,47 +148,23 @@ object Reminders {
                 fullScreenIntent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            val snoozePi = PendingIntent.getBroadcast(
-                ctx,
-                NOTIF_ID_OFFSET + 100_000 + cleared.id,
-                Intent(ctx, ReminderReceiver::class.java)
-                    .setAction(ACTION_SNOOZE_5M)
-                    .putExtra(EXTRA_PIN_ID, cleared.id),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-            val donePi = PendingIntent.getBroadcast(
-                ctx,
-                NOTIF_ID_OFFSET + 200_000 + cleared.id,
-                Intent(ctx, ReminderReceiver::class.java)
-                    .setAction(ACTION_DONE)
-                    .putExtra(EXTRA_PIN_ID, cleared.id),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
 
+            // No inline notification actions: keeps ColorOS glass banners clean/centered and
+            // prevents accidental 1-tap completion (tapping opens the full-screen hold-to-done UI).
             val builder = NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_pin)
                 .setContentTitle(cleared.title)
-                .setContentText(cleared.note.ifBlank { "Pinned reminder" })
+                .setContentText(cleared.note.ifBlank { "Tap to open reminder" })
                 .setCategory(NotificationCompat.CATEGORY_ALARM)
                 .setPriority(NotificationCompat.PRIORITY_MAX)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setAutoCancel(true)
                 .setContentIntent(fullScreenPi)
                 .setFullScreenIntent(fullScreenPi, true)
-                .addAction(0, "+5m", snoozePi)
-                .addAction(0, "Mark done", donePi)
 
             try {
                 NotificationManagerCompat.from(ctx).notify(NOTIF_ID_OFFSET + cleared.id, builder.build())
             } catch (_: SecurityException) {
-            }
-
-            // When Display over other apps is granted, launch full-screen immediately even if unlocked.
-            if (canDrawOverlays(ctx)) {
-                try {
-                    ctx.startActivity(fullScreenIntent)
-                } catch (_: Exception) {
-                }
             }
         } finally {
             if (wakeLock.isHeld) wakeLock.release()
@@ -219,24 +208,6 @@ class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         val pinId = intent.getIntExtra(Reminders.EXTRA_PIN_ID, -1)
         if (pinId < 0) return
-
-        when (intent.action) {
-            Reminders.ACTION_SNOOZE_5M -> {
-                Reminders.dismissAlert(ctx, pinId)
-                val target = System.currentTimeMillis() + 5L * 60 * 1000
-                Store.updateReminder(ctx, pinId, target)?.let { updated ->
-                    Reminders.schedule(ctx, updated)
-                    Notifier.show(ctx, updated, silent = true)
-                }
-            }
-            Reminders.ACTION_DONE -> {
-                Reminders.cancel(ctx, pinId)
-                Store.markDone(ctx, pinId)
-                Notifier.cancel(ctx, pinId)
-            }
-            else -> {
-                Store.load(ctx).find { it.id == pinId }?.let { Reminders.trigger(ctx, it) }
-            }
-        }
+        Store.load(ctx).find { it.id == pinId }?.let { Reminders.trigger(ctx, it) }
     }
 }

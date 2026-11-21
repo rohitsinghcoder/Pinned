@@ -11,9 +11,10 @@ phone (OnePlus 15, Termux).
   package" — always install with adb.
 
 ## Layout (`app/src/main/java/com/pinned/app/`)
-- `MainActivity.kt` — all UI: list (drag to reorder, confirm-before-done, reminder badges), composer panel attached to the keyboard (with optional full-screen reminder presets/time picker), Done history (today/yesterday), appearance (System/Light/Dark/AMOLED).
+- `MainActivity.kt` — all UI: list (drag to reorder, confirm-before-done, tappable reminder badges), composer panel attached to the keyboard (with full-screen reminder presets, Google Clock time dial & custom timer numpad), History (60-day retention), appearance (System/Light/Dark/AMOLED), Share-to-Pin.
 - `Notifier.kt` — ongoing notifications; `sync()` re-posts missing pins and refreshes pins ≥24h old to prevent ColorOS's 72h auto-timeout from expiring them.
 - `Receivers.kt` — re-post on swipe (plus sibling healing), restore after boot/app update, and 6h `SyncJobService` (`JobScheduler`) watchdog.
-- `Reminders.kt` — exact-alarm scheduling (`setAlarmClock`), silent high-priority full-screen notifications, and unlocked full-screen launch via `SYSTEM_ALERT_WINDOW`.
-- `ReminderActivity.kt` — full-screen vibration-only reminder screen with `+5m/+10m/+15m` snooze, Keep pinned, and Mark done.
-- `Store.kt` — pins (with optional `remindAt`), done history and theme in SharedPreferences as JSON.
+- `Reminders.kt` — exact-alarm scheduling (`setAlarmClock`), clean button-free lock-screen full-screen notifications, and routing unlocked reminders to `ReminderOverlayService`.
+- `ReminderActivity.kt` & `ReminderOverlayService.kt` — full-screen vibration-only reminder UI (Activity for lock screen, `TYPE_APPLICATION_OVERLAY` for unlocked takeover) with tap-to-silence, `+5m/+10m/+15m/Custom` snooze, Keep pinned, and 0.8s Hold-to-mark-done.
+- `QuickPinTileService.kt` — Quick Settings tile to open the composer in 1 tap from anywhere.
+- `Store.kt` — pins (with optional `remindAt`), 60-day completed history, and theme in SharedPreferences as JSON.
