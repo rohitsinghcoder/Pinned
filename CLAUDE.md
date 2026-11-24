@@ -5,10 +5,9 @@ Kotlin + Jetpack Compose (Material 3), no third-party libraries. Built and run e
 phone (OnePlus 15, Termux).
 
 ## Build & run
-- `./run.sh` — builds the debug APK, auto-connects via `~/bin/adb-connect`, installs, and launches.
+- `./gradlew assembleDebug` / `./gradlew assembleRelease` — standard build on desktop/CI (reads optional gitignored `keystore.properties` or `KEYSTORE_*` env vars for release signing).
+- `./run.sh` — builds the debug APK (auto-passing Termux's native `aapt2` override when run on Termux), auto-connects via `~/bin/adb-connect` if present, installs, and launches.
 - `~/bin/adb-connect` prefers `localhost:5555` (works offline); if unreachable (e.g. after reboot), it auto-discovers the Wireless Debugging port via mDNS (`_adb-tls-connect._tcp.local`), connects, and promotes it to `tcpip 5555`. No manual port typing needed as long as Wireless Debugging is on.
-- Installing via the system installer (termux-open / Files app) fails with "problem parsing the
-  package" — always install with adb.
 
 ## Layout (`app/src/main/java/com/pinned/app/`)
 - `MainActivity.kt` — all UI: list (drag to reorder, confirm-before-done, tappable reminder badges), composer panel attached to the keyboard (with full-screen reminder presets, Google Clock time dial & custom timer numpad), History (60-day retention), appearance (System/Light/Dark/AMOLED), Share-to-Pin.
